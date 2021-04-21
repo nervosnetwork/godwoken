@@ -81,11 +81,11 @@ class ChainService {
   }
 
   async getDataHash(dataHash) {
-    return this.nativeChange.getDataHash(new Reader(dataHash).toArrayBuffer());
+    return this.nativeChain.getDataHash(new Reader(dataHash).toArrayBuffer());
   }
 
   async getData(dataHash) {
-    return this.nativeChange.getData(new Reader(dataHash).toArrayBuffer());
+    return this.nativeChain.getData(new Reader(dataHash).toArrayBuffer());
   }
 
   tip() {
