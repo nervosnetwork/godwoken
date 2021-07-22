@@ -458,6 +458,27 @@ impl From<packed::L2Block> for L2BlockView {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum L2BlockStatus {
+    Unfinalized,
+    Finalized,
+    Reverted,
+}
+
+impl Default for L2BlockStatus {
+    fn default() -> Self {
+        Self::Unfinalized
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash, Debug)]
+#[serde(rename_all = "snake_case")]
+pub struct L2BlockWithStatus {
+    pub l2_block_view: L2BlockView,
+    pub l2_block_status: L2BlockStatus,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash, Debug)]
 #[serde(rename_all = "snake_case")]
 pub struct SubmitTransactions {

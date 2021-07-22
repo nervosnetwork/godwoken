@@ -6,7 +6,7 @@ use gw_generator::{sudt::build_l2_sudt_script, Generator};
 use gw_jsonrpc_types::{
     blockchain::Script,
     ckb_jsonrpc_types::{JsonBytes, Uint128, Uint32},
-    godwoken::{GlobalState, L2BlockView, RunResult, TxReceipt},
+    godwoken::{GlobalState, L2BlockStatus, L2BlockView, L2BlockWithStatus, RunResult, TxReceipt},
     test_mode::{ShouldProduceBlock, TestModePayload},
 };
 use gw_store::{
@@ -128,14 +128,26 @@ async fn ping() -> Result<String> {
 async fn get_block(
     Params((block_hash,)): Params<(JsonH256,)>,
     store: Data<Store>,
-) -> Result<Option<L2BlockView>> {
+) -> Result<Option<L2BlockWithStatus>> {
     let block_hash = to_h256(block_hash);
     let db = store.begin_transaction();
     let block_opt = db.get_block(&block_hash)?.map(|block| {
         let block_view: L2BlockView = block.into();
         block_view
     });
-    Ok(block_opt)
+    let l2_block_status = if H256::zero() != db.reverted_block_smt()?.get(&block_hash)? {
+        L2BlockStatus::Reverted
+    } else {
+        // let tip_block = db.get_last_valid_tip_block();
+        // let block_number = db.get_block_number(&block_hash)?;
+        // L2BlockStatus::Unfinalized if block_number <= tip_block_number - NUMBER_OF_CONFIRMATION
+
+        L2BlockStatus::Unfinalized
+    };
+    Ok(block_opt.map(|l2_block_view| L2BlockWithStatus {
+        l2_block_view,
+        l2_block_status,
+    }))
 }
 
 async fn get_block_by_number(
