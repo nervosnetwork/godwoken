@@ -1,12 +1,16 @@
 use crate::{
     indexer_types::{Order, Pagination, ScriptType, SearchKey, SearchKeyFilter, Tx},
     rpc_client::RPCClient,
+    types::TxStatus,
 };
 use crate::{types::ChainEvent, utils::to_result};
 use anyhow::{anyhow, Result};
 use async_jsonrpc_client::{Params as ClientParams, Transport};
 use ckb_fixed_hash::H256;
-use gw_chain::chain::{Chain, ChallengeCell, L1Action, L1ActionContext, SyncParam};
+use gw_chain::chain::{
+    Chain, ChallengeCell, L1Action, L1ActionContext, RevertL1ActionContext, RevertedL1Action,
+    SyncParam,
+};
 use gw_generator::RollupContext;
 use gw_jsonrpc_types::ckb_jsonrpc_types::{BlockNumber, HeaderView, TransactionWithStatus, Uint32};
 use gw_types::{
@@ -31,6 +35,7 @@ pub struct ChainUpdater {
     rollup_context: RollupContext,
     rollup_type_script: ckb_types::packed::Script,
     web3_indexer: Option<Web3Indexer>,
+    initialized: bool,
 }
 
 impl ChainUpdater {
@@ -51,22 +56,37 @@ impl ChainUpdater {
             rollup_type_script,
             last_tx_hash: None,
             web3_indexer,
+            initialized: false,
         }
     }
 
     // Start syncing
     pub async fn handle_event(&mut self, _event: ChainEvent) -> Result<()> {
-        let rollup_type_script = self.rollup_type_script.clone();
-        let tip_l1_block = self.chain.lock().local_state().last_synced().number();
+        // Always start from last valid tip on l1
+        if !self.initialized {
+            self.revert_to_valid_tip_on_l1().await?;
+            self.initialized = true;
+        }
+
+        // Check l1 fork
+        let local_tip_committed_info = { self.chain.lock().local_state().last_synced().to_owned() };
+        if !self.find_l2block_on_l1(local_tip_committed_info).await? {
+            self.revert_to_valid_tip_on_l1().await?;
+        }
+
+        let valid_tip_l1_block_number = {
+            let chain = self.chain.lock();
+            chain.local_state().last_synced().number().unpack()
+        };
         let search_key = SearchKey {
-            script: rollup_type_script.clone().into(),
+            script: self.rollup_type_script.clone().into(),
             script_type: ScriptType::Type,
             filter: Some(SearchKeyFilter {
                 script: None,
                 output_data_len_range: None,
                 output_capacity_range: None,
                 block_range: Some([
-                    BlockNumber::from(tip_l1_block.unpack() + 1),
+                    BlockNumber::from(valid_tip_l1_block_number + 1),
                     BlockNumber::from(u64::max_value()),
                 ]),
             }),
@@ -74,8 +94,6 @@ impl ChainUpdater {
         let order = Order::Asc;
         let limit = Uint32::from(1000);
 
-        // TODO: right now this logic does not handle forks well, we will need
-        // to tweak this.
         // TODO: the syncing logic here works under the assumption that a single
         // L1 CKB block can contain at most one L2 Godwoken block. The logic
         // here needs revising, once we relax this constraint for more performance.
@@ -165,7 +183,6 @@ impl ChainUpdater {
                 L1ActionContext::SubmitBlock {
                     l2block: submitted.block(),
                     deposit_requests: requests,
-                    reverted_block_hashes: submitted.reverted_block_hashes().unpack(),
                 }
             }
             RollupActionUnion::RollupEnterChallenge(entered) => {
@@ -192,7 +209,6 @@ impl ChainUpdater {
             l2block_committed_info,
             context,
         };
-        // TODO: handle layer1 fork
         let sync_param = SyncParam {
             reverts: vec![],
             updates: vec![update],
@@ -202,10 +218,85 @@ impl ChainUpdater {
         // TODO sync missed block
         match &self.web3_indexer {
             Some(indexer) => {
-                indexer.store(self.chain.lock().store().clone(), &tx).await;
+                let store = { self.chain.lock().store().to_owned() };
+                indexer.store(store, &tx).await;
             }
             None => {}
         }
+
+        Ok(())
+    }
+
+    async fn find_l2block_on_l1(&self, committed_info: L2BlockCommittedInfo) -> Result<bool> {
+        let rpc_client = &self.rpc_client;
+        let tx_hash: gw_common::H256 =
+            From::<[u8; 32]>::from(committed_info.transaction_hash().unpack());
+        let tx_status = rpc_client.get_transaction_status(tx_hash).await?;
+        if !matches!(tx_status, Some(TxStatus::Committed)) {
+            return Ok(false);
+        }
+
+        let block_hash: [u8; 32] = committed_info.block_hash().unpack();
+        let l1_block_hash = rpc_client.get_transaction_block_hash(tx_hash).await?;
+        Ok(l1_block_hash == Some(block_hash))
+    }
+
+    async fn revert_to_valid_tip_on_l1(&self) -> Result<()> {
+        let db = { self.chain.lock().store().begin_transaction() };
+        let mut revert_l1_actions = Vec::new();
+
+        // First rewind to last valid tip
+        let last_valid_tip_block_hash = db.get_last_valid_tip_block_hash()?;
+        let last_valid_tip_global_state = db
+            .get_block_post_global_state(&last_valid_tip_block_hash)?
+            .expect("valid tip global status should exists");
+        let last_valid_tip_committed_info = db
+            .get_l2block_committed_info(&last_valid_tip_block_hash)?
+            .expect("valid tip committed info should exists");
+        let rewind_to_last_valid_tip = RevertedL1Action {
+            prev_global_state: last_valid_tip_global_state,
+            l2block_committed_info: last_valid_tip_committed_info.clone(),
+            context: RevertL1ActionContext::RewindToLastValidTip,
+        };
+        revert_l1_actions.push(rewind_to_last_valid_tip);
+
+        // Revert until last valid block on l1 found
+        let mut local_valid_committed_info = last_valid_tip_committed_info;
+        let mut local_valid_block = db.get_last_valid_tip_block()?;
+        loop {
+            if self
+                .find_l2block_on_l1(local_valid_committed_info.clone())
+                .await?
+            {
+                break;
+            }
+
+            let local_valid_parent_block_hash: [u8; 32] =
+                local_valid_block.raw().parent_block_hash().unpack();
+            let local_valid_global_state = db
+                .get_block_post_global_state(&local_valid_parent_block_hash.into())?
+                .expect("valid tip global status should exists");
+            let revert_submit_valid_block = RevertedL1Action {
+                prev_global_state: local_valid_global_state,
+                l2block_committed_info: local_valid_committed_info,
+                context: RevertL1ActionContext::SubmitValidBlock {
+                    l2block: local_valid_block,
+                },
+            };
+            revert_l1_actions.push(revert_submit_valid_block);
+
+            local_valid_committed_info = db
+                .get_l2block_committed_info(&local_valid_parent_block_hash.into())?
+                .expect("valid block l2 committed info should exists");
+            local_valid_block = db
+                .get_block(&local_valid_parent_block_hash.into())?
+                .expect("valid block should exists");
+        }
+
+        self.chain.lock().sync(SyncParam {
+            reverts: revert_l1_actions,
+            updates: vec![],
+        })?;
 
         Ok(())
     }

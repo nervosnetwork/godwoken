@@ -3,7 +3,7 @@
 /// Column families alias type
 pub type Col = u8;
 /// Total column number
-pub const COLUMNS: u32 = 23;
+pub const COLUMNS: u32 = 25;
 /// Column store meta data
 pub const COLUMN_META: Col = 0;
 /// Column store chain index
@@ -50,6 +50,10 @@ pub const COLUMN_CHECKPOINT: Col = 20;
 pub const COLUMN_REVERTED_BLOCK_SMT_BRANCH: Col = 21;
 /// Column reverted block SMT leaf
 pub const COLUMN_REVERTED_BLOCK_SMT_LEAF: Col = 22;
+/// Column bad block challenge target
+pub const COLUMN_BAD_BLOCK_CHALLENGE_TARGET: Col = 23;
+/// Column reverted block smt root => reverted block hashes
+pub const COLUMN_REVERTED_BLOCK_SMT_ROOT: Col = 24;
 
 /// chain id
 pub const META_CHAIN_ID_KEY: &[u8] = b"CHAIN_ID";
@@ -63,6 +67,8 @@ pub const META_REVERTED_BLOCK_SMT_ROOT_KEY: &[u8] = b"REVERTED_BLOCK_SMT_ROOT_KE
 pub const META_ACCOUNT_SMT_ROOT_KEY: &[u8] = b"ACCOUNT_SMT_ROOT_KEY";
 /// account SMT count
 pub const META_ACCOUNT_SMT_COUNT_KEY: &[u8] = b"ACCOUNT_SMT_COUNT_KEY";
+/// track the latest known valid block hash
+pub const META_LAST_VALID_TIP_BLOCK_HASH_KEY: &[u8] = b"LAST_VALID_TIP_BLOCK_HASH";
 
 /// CHAIN_SPEC_HASH_KEY tracks the hash of chain spec which created current database
 pub const CHAIN_SPEC_HASH_KEY: &[u8] = b"chain-spec-hash";

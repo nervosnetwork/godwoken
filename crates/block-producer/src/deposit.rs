@@ -1,7 +1,4 @@
-use std::collections::HashSet;
-
-use crate::rpc_client::RPCClient;
-use crate::types::InputCellInfo;
+use crate::types::{CellInfo, InputCellInfo};
 
 use anyhow::Result;
 use ckb_types::prelude::Entity;
@@ -10,8 +7,8 @@ use gw_generator::RollupContext;
 use gw_types::bytes::Bytes;
 use gw_types::core::ScriptHashType;
 use gw_types::packed::{
-    CellDep, CellInput, CellOutput, CustodianLockArgs, RollupAction, RollupActionUnion, Script,
-    UnlockCustodianViaRevertWitness, WitnessArgs,
+    CellDep, CellInput, CellOutput, CustodianLockArgs, Script, UnlockCustodianViaRevertWitness,
+    WitnessArgs,
 };
 use gw_types::prelude::{Builder, Pack, Unpack};
 
@@ -22,31 +19,12 @@ pub struct RevertedDeposits {
     pub outputs: Vec<(CellOutput, Bytes)>,
 }
 
-pub async fn revert(
-    rollup_action: &RollupAction,
+pub fn revert(
     rollup_context: &RollupContext,
     block_producer_config: &BlockProducerConfig,
-    rpc_client: &RPCClient,
+    custodian_cells: Vec<CellInfo>,
 ) -> Result<Option<RevertedDeposits>> {
-    let submit_block = match rollup_action.to_enum() {
-        RollupActionUnion::RollupSubmitBlock(submit_block) => submit_block,
-        _ => return Ok(None),
-    };
-
-    if submit_block.reverted_block_hashes().is_empty() {
-        return Ok(None);
-    }
-
-    let reverted_block_hashes: HashSet<[u8; 32]> = submit_block
-        .reverted_block_hashes()
-        .into_iter()
-        .map(|h| h.unpack())
-        .collect();
-
-    let revert_custodian_cells = rpc_client
-        .query_custodian_cells_by_block_hashes(&reverted_block_hashes)
-        .await?;
-    if revert_custodian_cells.is_empty() {
+    if custodian_cells.is_empty() {
         return Ok(None);
     }
 
@@ -55,7 +33,7 @@ pub async fn revert(
     let mut deposit_outputs = vec![];
 
     let rollup_type_hash = rollup_context.rollup_script_hash.as_slice().iter();
-    for revert_custodian in revert_custodian_cells.into_iter() {
+    for revert_custodian in custodian_cells.into_iter() {
         let deposit_lock = {
             let args: Bytes = revert_custodian.output.lock().args().unpack();
             let custodian_lock_args = CustodianLockArgs::from_slice(&args.slice(32..))?;

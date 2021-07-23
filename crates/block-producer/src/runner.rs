@@ -1,7 +1,7 @@
 use crate::{
-    block_producer::BlockProducer, challenger::Challenger, poa::PoA, poller::ChainUpdater,
-    rpc_client::RPCClient, test_mode_control::TestModeControl, types::ChainEvent,
-    utils::CKBGenesisInfo, wallet::Wallet,
+    block_producer::BlockProducer, challenger::Challenger, cleaner::Cleaner, poa::PoA,
+    poller::ChainUpdater, rpc_client::RPCClient, test_mode_control::TestModeControl,
+    types::ChainEvent, utils::CKBGenesisInfo, wallet::Wallet,
 };
 use anyhow::{anyhow, Context, Result};
 use async_jsonrpc_client::HttpClient;
@@ -46,18 +46,21 @@ async fn poll_loop(
     chain_updater: ChainUpdater,
     block_producer: Option<BlockProducer>,
     challenger: Option<Challenger>,
+    cleaner: Option<Arc<Cleaner>>,
     poll_interval: Duration,
 ) -> Result<()> {
     struct Inner {
         chain_updater: ChainUpdater,
         block_producer: Option<BlockProducer>,
         challenger: Option<Challenger>,
+        cleaner: Option<Arc<Cleaner>>,
     }
 
     let inner = Arc::new(smol::lock::Mutex::new(Inner {
         chain_updater,
         challenger,
         block_producer,
+        cleaner,
     }));
     // get tip
     let (mut tip_number, mut tip_hash) = {
@@ -118,9 +121,18 @@ async fn poll_loop(
                 }
             }
 
-            // TODO: implement test mode challenge control
             if let Some(ref mut block_producer) = inner.block_producer {
                 if let Err(err) = block_producer.handle_event(event.clone()).await {
+                    log::error!(
+                        "Error occured when polling block_producer, event: {:?}, error: {}",
+                        event,
+                        err
+                    );
+                }
+            }
+
+            if let Some(ref cleaner) = inner.cleaner {
+                if let Err(err) = cleaner.handle_event(event.clone()).await {
                     log::error!(
                         "Error occured when polling block_producer, event: {:?}, error: {}",
                         event,
@@ -289,8 +301,8 @@ pub fn run(config: Config, skip_config_check: bool) -> Result<()> {
         CKBGenesisInfo::from_block(&ckb_genesis)?
     };
 
-    let (block_producer, challenger, test_mode_control) = match config.node_mode {
-        NodeMode::ReadOnly => (None, None, None),
+    let (block_producer, challenger, test_mode_control, cleaner) = match config.node_mode {
+        NodeMode::ReadOnly => (None, None, None, None),
         _ => {
             let block_producer_config = config
                 .block_producer
@@ -334,6 +346,15 @@ pub fn run(config: Config, skip_config_check: bool) -> Result<()> {
             )
             .with_context(|| "init block producer")?;
 
+            let cleaner = Arc::new(Cleaner::new(
+                rpc_client.clone(),
+                ckb_genesis_info.clone(),
+                wallet,
+            ));
+
+            let wallet = Wallet::from_config(&block_producer_config.wallet_config)
+                .with_context(|| "init wallet")?;
+
             // Challenger
             let challenger = Challenger::new(
                 rollup_context,
@@ -344,9 +365,15 @@ pub fn run(config: Config, skip_config_check: bool) -> Result<()> {
                 Arc::clone(&chain),
                 Arc::clone(&poa),
                 tests_control.clone(),
+                Arc::clone(&cleaner),
             );
 
-            (Some(block_producer), Some(challenger), tests_control)
+            (
+                Some(block_producer),
+                Some(challenger),
+                tests_control,
+                Some(cleaner),
+            )
         }
     };
 
@@ -386,7 +413,7 @@ pub fn run(config: Config, skip_config_check: bool) -> Result<()> {
     smol::block_on(async {
         select! {
             _ = ctrl_c.recv().fuse() => log::info!("Exiting..."),
-            e = poll_loop(rpc_client, chain_updater, block_producer, challenger, Duration::from_secs(3)).fuse() => {
+            e = poll_loop(rpc_client, chain_updater, block_producer, challenger, cleaner, Duration::from_secs(3)).fuse() => {
                 log::error!("Error in main poll loop: {:?}", e);
             }
             e = start_jsonrpc_server(rpc_address, rpc_registry).fuse() => {

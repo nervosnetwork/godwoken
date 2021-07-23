@@ -7,22 +7,45 @@ use gw_common::sparse_merkle_tree::CompiledMerkleProof;
 use gw_common::state::State;
 use gw_common::{blake2b::new_blake2b, H256};
 use gw_generator::traits::StateExt;
-use gw_generator::Generator;
+use gw_generator::{ChallengeContext, Generator};
 use gw_store::chain_view::ChainView;
 use gw_store::state_db::{CheckPoint, StateDBMode, StateDBTransaction, StateTree, SubState};
 use gw_store::transaction::StoreTransaction;
 use gw_traits::CodeStore;
 use gw_types::core::ChallengeTargetType;
 use gw_types::packed::{
-    BlockHashEntry, BlockHashEntryVec, BlockInfo, Byte32, ChallengeTarget, KVPairVec, L2Block,
-    L2Transaction, RawL2Block, RawL2BlockVec, RawL2Transaction, Script, ScriptVec, Uint32,
-    VerifyTransactionContext, VerifyTransactionSignatureContext, VerifyTransactionSignatureWitness,
-    VerifyTransactionWitness, VerifyWithdrawalWitness,
+    BlockHashEntry, BlockHashEntryVec, BlockInfo, Byte32, ChallengeTarget, ChallengeWitness,
+    KVPairVec, L2Block, L2Transaction, RawL2Block, RawL2BlockVec, RawL2Transaction, Script,
+    ScriptVec, Uint32, VerifyTransactionContext, VerifyTransactionSignatureContext,
+    VerifyTransactionSignatureWitness, VerifyTransactionWitness, VerifyWithdrawalWitness,
 };
 use gw_types::prelude::{Builder, Entity, Pack, Reader, Unpack};
 
 use std::convert::TryInto;
 use std::sync::Arc;
+
+pub fn build_challenge_context(
+    db: &StoreTransaction,
+    target: ChallengeTarget,
+) -> Result<ChallengeContext> {
+    let block_hash: H256 = target.block_hash().unpack();
+    let block = {
+        let opt_ = db.get_block(&block_hash)?;
+        opt_.ok_or_else(|| anyhow!("bad block {} not found", hex::encode(block_hash.as_slice())))?
+    };
+
+    let block_smt = db.block_smt()?;
+    let block_proof = block_smt
+        .merkle_proof(vec![block.smt_key().into()])?
+        .compile(vec![(block.smt_key().into(), block.hash().into())])?;
+
+    let witness = ChallengeWitness::new_builder()
+        .raw_l2block(block.raw())
+        .block_proof(block_proof.0.pack())
+        .build();
+
+    Ok(ChallengeContext { target, witness })
+}
 
 #[derive(Debug, Clone)]
 pub enum VerifyWitness {

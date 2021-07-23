@@ -1,7 +1,9 @@
 use crate::testing_tool::chain::{
     build_sync_tx, construct_block, setup_chain, ALWAYS_SUCCESS_CODE_HASH,
 };
-use gw_chain::chain::{Chain, L1Action, L1ActionContext, RevertedL1Action, SyncParam};
+use gw_chain::chain::{
+    Chain, L1Action, L1ActionContext, RevertL1ActionContext, RevertedL1Action, SyncParam,
+};
 use gw_common::{
     builtins::CKB_SUDT_ACCOUNT_ID,
     state::{to_short_address, State},
@@ -34,7 +36,6 @@ fn produce_a_block(
         context: L1ActionContext::SubmitBlock {
             l2block,
             deposit_requests: vec![deposit.clone()],
-            reverted_block_hashes: vec![],
         },
         transaction,
         l2block_committed_info,
@@ -181,7 +182,6 @@ fn test_layer1_fork() {
             context: L1ActionContext::SubmitBlock {
                 l2block: block_result.block.clone(),
                 deposit_requests: vec![deposit],
-                reverted_block_hashes: vec![],
             },
             transaction: build_sync_tx(rollup_cell.clone(), block_result),
             l2block_committed_info: L2BlockCommittedInfo::new_builder()
@@ -211,7 +211,6 @@ fn test_layer1_fork() {
         context: L1ActionContext::SubmitBlock {
             l2block: block_result.block.clone(),
             deposit_requests: vec![deposit.clone()],
-            reverted_block_hashes: vec![],
         },
         transaction: build_sync_tx(rollup_cell.clone(), block_result),
         l2block_committed_info: L2BlockCommittedInfo::new_builder()
@@ -246,7 +245,6 @@ fn test_layer1_fork() {
         context: L1ActionContext::SubmitBlock {
             l2block: block_result.block.clone(),
             deposit_requests: vec![deposit],
-            reverted_block_hashes: vec![],
         },
         transaction: build_sync_tx(rollup_cell.clone(), block_result),
         l2block_committed_info: L2BlockCommittedInfo::new_builder()
@@ -264,30 +262,49 @@ fn test_layer1_fork() {
     assert_eq!(tip_block_number, 2);
 
     // revert blocks
-    let updates = vec![action1, action2];
-    let reverts = updates
-        .into_iter()
-        .rev()
-        .map(|action| {
-            let prev_global_state = GlobalState::default();
-            let L1Action {
-                transaction,
-                l2block_committed_info,
-                context,
-            } = action;
-            RevertedL1Action {
-                prev_global_state,
-                transaction,
-                l2block_committed_info,
-                context,
-            }
-        })
-        .collect::<Vec<_>>();
+    let db = chain.store().begin_transaction();
+    let tip_block_parent_hash: H256 = tip_block.raw().parent_block_hash().unpack();
+    let revert_action2 = {
+        let prev_global_state = db
+            .get_block_post_global_state(&tip_block_parent_hash)
+            .unwrap()
+            .unwrap();
+        let l2block_committed_info = db
+            .get_l2block_committed_info(&tip_block_parent_hash)
+            .unwrap()
+            .unwrap();
+        let context = RevertL1ActionContext::SubmitValidBlock { l2block: tip_block };
+        RevertedL1Action {
+            prev_global_state,
+            l2block_committed_info,
+            context,
+        }
+    };
+    let tip_parent_block = db.get_block(&tip_block_parent_hash).unwrap().unwrap();
+    let tip_grandpa_block_hash: H256 = tip_parent_block.raw().parent_block_hash().unpack();
+    let revert_action1 = {
+        let prev_global_state = db
+            .get_block_post_global_state(&tip_grandpa_block_hash)
+            .unwrap()
+            .unwrap();
+        let l2block_committed_info = db
+            .get_l2block_committed_info(&tip_grandpa_block_hash)
+            .unwrap()
+            .unwrap();
+        let context = RevertL1ActionContext::SubmitValidBlock {
+            l2block: tip_parent_block,
+        };
+        RevertedL1Action {
+            prev_global_state,
+            l2block_committed_info,
+            context,
+        }
+    };
     let forks = vec![fork_action];
 
     let param = SyncParam {
         updates: forks,
-        reverts,
+        reverts: vec![revert_action2, revert_action1],
     };
     chain.sync(param).unwrap();
     assert_eq!(chain.last_sync_event().is_success(), true);
@@ -354,7 +371,6 @@ fn test_layer1_revert() {
         context: L1ActionContext::SubmitBlock {
             l2block: block_result.block.clone(),
             deposit_requests: vec![deposit.clone()],
-            reverted_block_hashes: vec![],
         },
         transaction: build_sync_tx(rollup_cell.clone(), block_result),
         l2block_committed_info: L2BlockCommittedInfo::new_builder()
@@ -389,7 +405,6 @@ fn test_layer1_revert() {
         context: L1ActionContext::SubmitBlock {
             l2block: block_result.block.clone(),
             deposit_requests: vec![deposit],
-            reverted_block_hashes: vec![],
         },
         transaction: build_sync_tx(rollup_cell.clone(), block_result),
         l2block_committed_info: L2BlockCommittedInfo::new_builder()
@@ -414,13 +429,17 @@ fn test_layer1_revert() {
         .map(|action| {
             let prev_global_state = GlobalState::default();
             let L1Action {
-                transaction,
+                transaction: _,
                 l2block_committed_info,
                 context,
             } = action;
+            let l2block = match context {
+                L1ActionContext::SubmitBlock { l2block, .. } => l2block,
+                _ => unreachable!(),
+            };
+            let context = RevertL1ActionContext::SubmitValidBlock { l2block };
             RevertedL1Action {
                 prev_global_state,
-                transaction,
                 l2block_committed_info,
                 context,
             }

@@ -490,35 +490,43 @@ impl BlockProducer {
             .cell_deps_mut()
             .push(self.ckb_genesis_info.sighash_dep());
 
+        // Package pending revert withdrawals and custodians
+        let db = { self.chain.lock().store().begin_transaction() };
+        let reverted_block_hashes = db.get_reverted_block_hashes()?;
+
+        let rpc_client = &self.rpc_client;
+        let (revert_custodians, mut collected_block_hashes) = rpc_client
+            .query_custodian_cells_by_block_hashes(&reverted_block_hashes)
+            .await?;
+        let (revert_withdrawals, block_hashes) = rpc_client
+            .query_withdrawal_cells_by_block_hashes(&reverted_block_hashes)
+            .await?;
+        collected_block_hashes.extend(block_hashes);
+
         // rollup action
         let rollup_action = {
-            let revert_block = {
-                let chain = self.chain.lock();
-                let first_block = chain.pending_revert_blocks().first();
-                first_block.map(|b| b.to_owned())
-            };
+            let submit_builder = if !collected_block_hashes.is_empty() {
+                let db = self.store.begin_transaction();
+                let block_smt = db.reverted_block_smt()?;
 
-            let submit_builder = match revert_block {
-                Some(revert_block) => {
-                    let db = self.store.begin_transaction();
-                    let block_smt = db.reverted_block_smt()?;
+                let local_root: &H256 = block_smt.root();
+                let global_revert_block_root: H256 = global_state.reverted_block_root().unpack();
+                assert_eq!(local_root, &global_revert_block_root);
 
-                    let local_root: &H256 = block_smt.root();
-                    let global_revert_block_root: H256 =
-                        global_state.reverted_block_root().unpack();
-                    assert_eq!(local_root, &global_revert_block_root);
-
-                    let revert_block_hash = revert_block.hash();
-                    let proof = block_smt
-                        .merkle_proof(vec![H256::from(revert_block_hash)])?
-                        .compile(vec![(H256::from(revert_block_hash), H256::one())])?;
-                    log::info!("submit revert block {}", hex::encode(revert_block_hash));
-
-                    RollupSubmitBlock::new_builder()
-                        .reverted_block_hashes(vec![revert_block.hash()].pack())
-                        .reverted_block_proof(proof.0.pack())
+                let keys: Vec<H256> = collected_block_hashes.into_iter().collect();
+                let leaves = keys.iter().map(|hash| (*hash, H256::one()));
+                let proof = block_smt
+                    .merkle_proof(keys.clone())?
+                    .compile(leaves.collect())?;
+                for key in keys.iter() {
+                    log::info!("submit revert block {:?}", hex::encode(key.as_slice()));
                 }
-                None => RollupSubmitBlock::new_builder(),
+
+                RollupSubmitBlock::new_builder()
+                    .reverted_block_hashes(keys.pack())
+                    .reverted_block_proof(proof.0.pack())
+            } else {
+                RollupSubmitBlock::new_builder()
             };
 
             let submit_block = submit_builder.block(block.clone()).build();
@@ -652,13 +660,8 @@ impl BlockProducer {
                 .extend(generated_withdrawal_cells.outputs);
         }
 
-        if let Some(reverted_deposits) = crate::deposit::revert(
-            &rollup_action,
-            &rollup_context,
-            &self.config,
-            &self.rpc_client,
-        )
-        .await?
+        if let Some(reverted_deposits) =
+            crate::deposit::revert(&rollup_context, &self.config, revert_custodians)?
         {
             log::info!("reverted deposits {}", reverted_deposits.inputs.len());
 
@@ -683,13 +686,8 @@ impl BlockProducer {
         }
 
         // reverted withdrawal cells
-        if let Some(reverted_withdrawals) = crate::withdrawal::revert(
-            &rollup_action,
-            rollup_context,
-            &self.config,
-            &self.rpc_client,
-        )
-        .await?
+        if let Some(reverted_withdrawals) =
+            crate::withdrawal::revert(rollup_context, &self.config, revert_withdrawals)?
         {
             log::info!("reverted withdrawals {}", reverted_withdrawals.inputs.len());
 

@@ -1,5 +1,6 @@
 #![allow(clippy::mutable_key_type)]
 
+use crate::cleaner::{Cleaner, VerifierCell};
 use crate::poa::{PoA, ShouldIssueBlock};
 use crate::rpc_client::RPCClient;
 use crate::test_mode_control::TestModeControl;
@@ -46,6 +47,7 @@ pub struct Challenger {
     chain: Arc<parking_lot::Mutex<Chain>>,
     poa: Arc<Mutex<PoA>>,
     tests_control: Option<TestModeControl>,
+    cleaner: Arc<Cleaner>,
 }
 
 impl Challenger {
@@ -59,6 +61,7 @@ impl Challenger {
         chain: Arc<parking_lot::Mutex<Chain>>,
         poa: Arc<Mutex<PoA>>,
         tests_control: Option<TestModeControl>,
+        cleaner: Arc<Cleaner>,
     ) -> Self {
         Self {
             rollup_context,
@@ -69,6 +72,7 @@ impl Challenger {
             poa,
             chain,
             tests_control,
+            cleaner,
         }
     }
 
@@ -93,30 +97,6 @@ impl Challenger {
             let check_lock = poa.should_issue_next_block(median_time, &rollup_input);
             if ShouldIssueBlock::Yes != check_lock.await? {
                 return Ok(());
-            }
-        }
-
-        // Reclaim verifier cell if rollup is running
-        {
-            if Status::Running == rollup.status()? {
-                let allowed_scripts = {
-                    let eoa = self.config.allowed_eoa_deps.iter();
-                    eoa.chain(self.config.allowed_contract_deps.iter())
-                };
-                let rpc_client = &self.rpc_client;
-                let owner_lock_hash = self.wallet.lock_script().hash();
-
-                for (script_type_hash, dep) in allowed_scripts {
-                    if let Some(cell_info) = rpc_client
-                        .query_verifier_cell(script_type_hash.0, owner_lock_hash)
-                        .await?
-                    {
-                        let cell_dep: CellDep = dep.to_owned().into();
-                        if let Err(err) = self.reclaim_verifier(cell_dep, cell_info).await {
-                            log::error!("reclaim verifier failed {}", err);
-                        }
-                    }
-                }
             }
         }
 
@@ -308,14 +288,19 @@ impl Challenger {
         )
         .await;
 
+        let verifier_cell = VerifierCell::new(
+            verifier_context.cell_dep,
+            verifier_context.input,
+            verifier_context.witness,
+        );
         match self.rpc_client.send_transaction(tx).await {
-            Ok(tx_hash) => log::info!("Cancel challenge in tx {}", to_hex(&tx_hash)),
+            Ok(tx_hash) => {
+                self.cleaner.watch_verifier(verifier_cell, Some(tx_hash));
+                log::info!("Cancel challenge in tx {}", to_hex(&tx_hash));
+            }
             Err(err) => {
-                log::error!("Cancel challenge failed: {}", err);
-
-                let tx = self.build_reclaim_verifier_tx(verifier_context);
-                let tx_hash = self.rpc_client.send_transaction(tx.await?).await?;
-                log::info!("Reclaim verifier in tx {}", to_hex(&tx_hash));
+                self.cleaner.watch_verifier(verifier_cell, None);
+                log::warn!("Cancel challenge failed {}", err);
             }
         }
 
@@ -342,10 +327,15 @@ impl Challenger {
         };
         let challenge_cell = to_cell_info(challenge_cell);
         let challenge_tx_block_number = {
-            let tx_hash: [u8; 32] = challenge_cell.out_point.tx_hash().unpack();
-            let query = self.rpc_client.get_transaction_block_number(tx_hash.into());
-            let block_number = query.await?;
-            block_number.ok_or_else(|| anyhow!("challenge tx block number not found"))?
+            let tx_hash: H256 = challenge_cell.out_point.tx_hash().unpack();
+            let tx_status = self.rpc_client.get_transaction_status(tx_hash).await?;
+            if !matches!(tx_status, Some(TxStatus::Committed)) {
+                log::debug!("challenge tx isn't committed");
+                return Ok(());
+            }
+
+            let query = self.rpc_client.get_transaction_block_number(tx_hash).await;
+            query?.ok_or_else(|| anyhow!("challenge tx block number not found"))?
         };
 
         const FLAG_SINCE_RELATIVE: u64 =
@@ -450,19 +440,6 @@ impl Challenger {
         Ok(())
     }
 
-    // FIXME: Support reclaim signature verifier cell. Remove addition signature
-    // requirement to unlock.
-    async fn reclaim_verifier(&self, cell_dep: CellDep, cell_info: CellInfo) -> Result<()> {
-        let input = to_input_cell_info(cell_info);
-
-        let ctx = VerifierContext::new(cell_dep, input, None, None);
-        let tx = self.build_reclaim_verifier_tx(ctx);
-        let tx_hash = self.rpc_client.send_transaction(tx.await?).await?;
-        log::info!("Reclaim verifier in tx {}", to_hex(&tx_hash));
-
-        Ok(())
-    }
-
     async fn build_verifier_tx(&self, verifier: (CellOutput, Bytes)) -> Result<Transaction> {
         let mut tx_skeleton = TransactionSkeleton::default();
         tx_skeleton.outputs_mut().push(verifier);
@@ -535,33 +512,6 @@ impl Challenger {
             let poa = self.poa.lock().await;
             poa.fill_poa(&mut tx_skeleton, 0, media_time).await?;
         }
-
-        let owner_lock = self.wallet.lock_script().to_owned();
-        fill_tx_fee(&mut tx_skeleton, &self.rpc_client, owner_lock).await?;
-        self.wallet.sign_tx_skeleton(tx_skeleton)
-    }
-
-    async fn build_reclaim_verifier_tx(
-        &self,
-        verifier_context: VerifierContext,
-    ) -> Result<Transaction> {
-        let verifier_tx_hash = verifier_context.tx_hash();
-        let mut tx_skeleton = TransactionSkeleton::default();
-
-        tx_skeleton.cell_deps_mut().push(verifier_context.cell_dep);
-        tx_skeleton.inputs_mut().push(verifier_context.input);
-        if let Some(verifier_witness) = verifier_context.witness {
-            tx_skeleton.witnesses_mut().push(verifier_witness);
-        }
-
-        // Verifier cell need an owner cell to unlock
-        let owner_input = self
-            .query_owner_cell_for_verifier(verifier_tx_hash, verifier_context.spent_inputs)
-            .await?;
-
-        let owner_lock_dep = self.ckb_genesis_info.sighash_dep();
-        tx_skeleton.cell_deps_mut().push(owner_lock_dep);
-        tx_skeleton.inputs_mut().push(owner_input);
 
         let owner_lock = self.wallet.lock_script().to_owned();
         fill_tx_fee(&mut tx_skeleton, &self.rpc_client, owner_lock).await?;

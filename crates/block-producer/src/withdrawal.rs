@@ -13,15 +13,14 @@ use gw_types::{
     core::ScriptHashType,
     packed::{
         CellDep, CellInput, CellOutput, CustodianLockArgs, DepositLockArgs, GlobalState, L2Block,
-        RollupAction, RollupActionUnion, Script, UnlockWithdrawalViaRevert,
-        UnlockWithdrawalWitness, UnlockWithdrawalWitnessUnion, WithdrawalLockArgs,
-        WithdrawalRequest, WitnessArgs,
+        Script, UnlockWithdrawalViaRevert, UnlockWithdrawalWitness, UnlockWithdrawalWitnessUnion,
+        WithdrawalLockArgs, WithdrawalRequest, WitnessArgs,
     },
     prelude::*,
 };
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -354,31 +353,12 @@ pub struct RevertedWithdrawals {
     pub outputs: Vec<(CellOutput, Bytes)>,
 }
 
-pub async fn revert(
-    rollup_action: &RollupAction,
+pub fn revert(
     rollup_context: &RollupContext,
     block_producer_config: &BlockProducerConfig,
-    rpc_client: &RPCClient,
+    withdrawal_cells: Vec<CellInfo>,
 ) -> Result<Option<RevertedWithdrawals>> {
-    let submit_block = match rollup_action.to_enum() {
-        RollupActionUnion::RollupSubmitBlock(submit_block) => submit_block,
-        _ => return Ok(None),
-    };
-
-    if submit_block.reverted_block_hashes().is_empty() {
-        return Ok(None);
-    }
-
-    let reverted_block_hashes: HashSet<[u8; 32]> = submit_block
-        .reverted_block_hashes()
-        .into_iter()
-        .map(|h| h.unpack())
-        .collect();
-
-    let reverted_withdrawal_cells = rpc_client
-        .query_withdrawal_cells_by_block_hashes(&reverted_block_hashes)
-        .await?;
-    if reverted_withdrawal_cells.is_empty() {
+    if withdrawal_cells.is_empty() {
         return Ok(None);
     }
 
@@ -397,7 +377,7 @@ pub async fn revert(
     // NOTE: These locks must also be different from custodian change cells created by
     // withdrawal requests processing.
     let rollup_type_hash = rollup_context.rollup_script_hash.as_slice().iter();
-    for (idx, withdrawal) in reverted_withdrawal_cells.into_iter().enumerate() {
+    for (idx, withdrawal) in withdrawal_cells.into_iter().enumerate() {
         let custodian_lock = {
             let deposit_lock_args = DepositLockArgs::new_builder()
                 .owner_lock_hash(rollup_context.rollup_script_hash.pack())
